@@ -1,4 +1,3 @@
-import argparse
 import os
 import copy
 
@@ -14,7 +13,6 @@ from segment_anything import build_sam, SamPredictor
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-
 import gc
 
 def show_mask(mask, ax, random_color=False):
@@ -71,122 +69,100 @@ def load_owlvit(checkpoint_path="owlvit-large-patch14", device='cpu'):
     """
     Return: model, processor (for text inputs)
     """
-    processor = OwlViTProcessor.from_pretrained(f"google/{checkpoint_path}")
-    model = OwlViTForObjectDetection.from_pretrained(f"google/{checkpoint_path}")
+    processor = OwlViTProcessor.from_pretrained(f"google/{checkpoint_path}",cache_dir = "./processor")
+    model = OwlViTForObjectDetection.from_pretrained(f"google/{checkpoint_path}",cache_dir = "./model")
     model.to(device)
     model.eval()
     
     return model, processor
 
+# set configs
+output_dir = "outputs"
+text_prompt = "cat"
+image_path = "images/cats.png"
+device = "cuda"
+image_name = image_path.split("/")[-1].split(".")[0]
 
+# make dir
+os.makedirs(output_dir, exist_ok=True)
+# load image & texts
+image = Image.open(image_path)
+texts = [text_prompt.split(",")]
 
+# add "a photo of a" before each text
+texts = [["a photo of a " + text for text in texts[0]]]
 
-if __name__ == "__main__":
+# load OWL-ViT model
+processor = OwlViTProcessor.from_pretrained("google/owlvit-base-patch32",cache_dir = "./processor")
+model = OwlViTForObjectDetection.from_pretrained("google/owlvit-base-patch32",cache_dir = "./model")
+model.to(device)
 
-    parser = argparse.ArgumentParser("OWL-ViT Segment Aything", add_help=True)
+# run object detection model
+with torch.no_grad():
+    inputs = processor(text=texts, images=image, return_tensors="pt").to(device)
+    outputs = model(**inputs)
 
-    parser.add_argument("--image_path", "-i", type=str, required=True, help="path to image file")
-    parser.add_argument("--text_prompt", "-t", type=str, required=True, help="text prompt")
-    parser.add_argument(
-        "--output_dir", "-o", type=str, default="outputs", required=True, help="output directory"
-    )
-    parser.add_argument('--owlvit_model', help='select model', default="owlvit-base-patch32", choices=["owlvit-base-patch32", "owlvit-base-patch16", "owlvit-large-patch14"])
-    parser.add_argument("--box_threshold", type=float, default=0.1, help="box threshold")
-    parser.add_argument('--get_topk', help='detect topk boxes per class or not', action="store_true")
-    parser.add_argument('--device', help='select device', default="cuda:0", type=str)
-    args = parser.parse_args()
+# Target image sizes (height, width) to rescale box predictions [batch_size, 2]
+target_sizes = torch.Tensor([image.size[::-1]])
+# Convert outputs (bounding boxes and class logits) to Pascal VOC format (xmin, ymin, xmax, ymax)
+results = processor.post_process_object_detection(outputs=outputs, target_sizes=target_sizes, threshold=0.1)
+i = 0  # Retrieve predictions for the first image for the corresponding text queries
+text = texts[i]
+boxes, scores, labels = results[i]["boxes"], results[i]["scores"], results[i]["labels"]
 
-    # cfg
-    # checkpoint_path = args.checkpoint_path  # change the path of the model
-    image_path = args.image_path
-    text_prompt = args.text_prompt
-    output_dir = args.output_dir
-    box_threshold = args.box_threshold
-    if args.get_topk:
-        box_threshold = 0.0
+# Print detected objects and rescaled box coordinates
+for box, score, label in zip(boxes, scores, labels):
+    box = [round(i, 2) for i in box.tolist()]
+    print(f"Detected {text[label]} with confidence {round(score.item(), 3)} at location {box}")
 
-    # make dir
-    os.makedirs(output_dir, exist_ok=True)
-    # load image & texts
-    image = Image.open(args.image_path)
-    texts = [text_prompt.split(",")]
+boxes = boxes.cpu().detach().numpy()
+normalized_boxes = copy.deepcopy(boxes)
 
-    print(texts)
-    # add "a photo of a" before each text
-    texts = [["a photo of a " + text for text in texts[0]]]
-    print(texts)
+# # visualize pred
+size = image.size
+pred_dict = {
+    "boxes": normalized_boxes,
+    "size": [size[1], size[0]], # H, W
+    "labels": [text[idx] for idx in labels]
+}
 
-    # load OWL-ViT model
-    model, processor = load_owlvit(checkpoint_path=args.owlvit_model, device=args.device)
+# release the OWL-ViT
+model.cpu()
+del model
+gc.collect()
+torch.cuda.empty_cache()
 
-    # run object detection model
-    with torch.no_grad():
-        inputs = processor(text=texts, images=image, return_tensors="pt").to(args.device)
-        outputs = model(**inputs)
-    
-    # Target image sizes (height, width) to rescale box predictions [batch_size, 2]
-    target_sizes = torch.Tensor([image.size[::-1]])
-    # Convert outputs (bounding boxes and class logits) to COCO API
-    results = processor.post_process_object_detection(outputs=outputs, threshold=0.1, target_sizes=target_sizes.to(args.device))
-    
-    i = 0  # Retrieve predictions for the first image for the corresponding text queries
-    text = texts[i]
-    boxes, scores, labels = results[i]["boxes"], results[i]["scores"], results[i]["labels"]
-    
+# run segment anything (SAM)
+predictor = SamPredictor(build_sam(checkpoint="./sam_vit_h_4b8939.pth"))
+image = cv2.imread(image_path)
+image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+predictor.set_image(image)
 
-    # Print detected objects and rescaled box coordinates
-    for box, score, label in zip(boxes, scores, labels):
-        box = [round(i, 2) for i in box.tolist()]
-        print(f"Detected {text[label]} with confidence {round(score.item(), 3)} at location {box}")
+H, W = size[1], size[0]
 
-    boxes = boxes.cpu().detach().numpy()
-    normalized_boxes = copy.deepcopy(boxes)
-    
-    # # visualize pred
-    size = image.size
-    pred_dict = {
-        "boxes": normalized_boxes,
-        "size": [size[1], size[0]], # H, W
-        "labels": [text[idx] for idx in labels]
-    }
+for i in range(boxes.shape[0]):
+    boxes[i] = torch.Tensor(boxes[i])
 
-    # release the OWL-ViT
-    model.cpu()
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
+boxes = torch.tensor(boxes, device=predictor.device)
 
-    # run segment anything (SAM)
-    predictor = SamPredictor(build_sam(checkpoint="./sam_vit_h_4b8939.pth"))
-    image = cv2.imread(args.image_path)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    predictor.set_image(image)
-    
-    H, W = size[1], size[0]
+transformed_boxes = predictor.transform.apply_boxes_torch(boxes, image.shape[:2])
 
-    for i in range(boxes.shape[0]):
-        boxes[i] = torch.Tensor(boxes[i])
+masks, _, _ = predictor.predict_torch(
+    point_coords = None,
+    point_labels = None,
+    boxes = transformed_boxes,
+    multimask_output = False,
+)
+plt.figure(figsize=(10, 10))
+plt.imshow(image)
+for mask in masks:
+    show_mask(mask.cpu().numpy(), plt.gca(), random_color=True)
+for box in boxes:
+    show_box(box.numpy(), plt.gca())
+plt.axis('off')
+plt.savefig(f"./{output_dir}/result_mask_{image_name}.jpg")
 
-    boxes = torch.tensor(boxes, device=predictor.device)
-
-    transformed_boxes = predictor.transform.apply_boxes_torch(boxes, image.shape[:2])
-    
-    masks, _, _ = predictor.predict_torch(
-        point_coords = None,
-        point_labels = None,
-        boxes = transformed_boxes,
-        multimask_output = False,
-    )
-    plt.figure(figsize=(10, 10))
-    plt.imshow(image)
-    for mask in masks:
-        show_mask(mask.cpu().numpy(), plt.gca(), random_color=True)
-    for box in boxes:
-        show_box(box.numpy(), plt.gca())
-    plt.axis('off')
-    plt.savefig(f"./{output_dir}/owlvit_segment_anything_output.jpg")
-
-    # grounded results
-    image_pil = Image.open(args.image_path)
-    image_with_box = plot_boxes_to_image(image_pil, pred_dict)[0]
-    image_with_box.save(os.path.join(f"./{output_dir}/owlvit_box.jpg"))
+# grounded results
+image_pil = Image.open(image_path)
+image_with_box = plot_boxes_to_image(image_pil, pred_dict)[0]
+image_with_box.save(os.path.join(f"./{output_dir}/result_box_{image_name}.jpg"))
