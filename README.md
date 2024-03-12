@@ -8,11 +8,15 @@ Installing both PyTorch and TorchVision with CUDA support is strongly recommende
 
 Install Segment Anything:
 
+```
 pip install git+https://github.com/facebookresearch/segment-anything.git
+```
 
 Install OWL-ViT (the OWL-ViT is included in transformer library):
 
+```
 pip install transformers
+```
 
 # Run
 
